@@ -4,16 +4,19 @@ from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
+from copy import deepcopy
 import cv2
 import numpy as np
 import torch
 import torchvision
+import os
+import math
 
 from ultralytics.utils import LOCAL_RANK, NUM_THREADS, TQDM, colorstr, is_dir_writeable
 
-from .augment import Compose, Format, Instances, LetterBox, classify_albumentations, classify_transforms, v8_transforms
+from .augment import Compose, Format, Instances, LetterBox, classify_albumentations, classify_transforms, v8_transforms, SiameseToTensor
 from .base import BaseDataset
-from .utils import HELP_URL, LOGGER, get_hash, img2label_paths, verify_image, verify_image_label
+from .utils import HELP_URL, LOGGER, get_hash, img2label_paths, verify_image, verify_image_label, verify_image_label_siamese
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for YOLOv8
 DATASET_CACHE_VERSION = '1.0.3'
@@ -338,3 +341,225 @@ class SemanticDataset(BaseDataset):
     def __init__(self):
         """Initialize a SemanticDataset object."""
         super().__init__()
+
+# SiameseYoloDualInputs
+class SiameseDataset(YOLODataset):
+    def __init__(self, *args, siamese=True, **kwargs):
+        """Initializes the SiameseDataset with configurations for segments."""
+        super().__init__(*args, siamese=siamese, **kwargs)
+
+    def get_img_files(self, img_path):
+        self.img_path = img_path
+        # Template
+        img_files_A = super().get_img_files(os.path.join(img_path, "A"))
+        # Flaw
+        img_files_B = super().get_img_files(os.path.join(img_path, "B"))
+        return [[img_file_A, img_file_B]for img_file_A, img_file_B in zip(img_files_A, img_files_B)]
+
+    def load_single_image(self, f, fn, rect_mode):
+        if fn.exists():  # load npy
+            try:
+                im = np.load(fn)
+            except Exception as e:
+                LOGGER.warning(f'{self.prefix}WARNING ⚠️ Removing corrupt *.npy image file {fn} due to: {e}')
+                Path(fn).unlink(missing_ok=True)
+                im = cv2.imread(f)  # BGR
+        else:  # read image
+            im = cv2.imread(f)  # BGR
+        if im is None:
+            raise FileNotFoundError(f'Image Not Found {f}')
+
+        h0, w0 = im.shape[:2]  # orig hw
+        if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
+            r = self.imgsz / max(h0, w0)  # ratio
+            if r != 1:  # if sizes are not equal
+                w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+        elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
+            im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+
+        return im, (h0, w0), im.shape[:2]
+
+    def resize(self, mask, rect_mode):
+        h0, w0 = mask.shape[:2]
+        if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
+            r = self.imgsz / max(h0, w0)  # ratio
+            if r != 1:  # if sizes are not equal
+                w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+        elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
+            mask = cv2.resize(mask, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+        return mask
+
+    def load_image(self, i, rect_mode=True):
+        ims, fs, fns = self.ims[i], self.im_files[i], self.npy_files[i]
+        # ims: [im_tmp, im_flaw]; fs: [path1, path2]; fns: [path1, path2]
+        # 有可能输入的时候ims就是None
+        # im_tmp, im_flaw = ims
+        # 加载labels，修改label的大小
+        f_tmp, f_flaw = fs
+        fn_tmp, fn_flaw = fns
+        if ims is None:  # not cached in RAM
+            im_tmp, (h0_tmp, w0_tmp), im_tmp_shape = self.load_single_image(f_tmp, fn_tmp, rect_mode=rect_mode)
+            im_flaw, (h0_flaw, w0_flaw), im_flaw_shape = self.load_single_image(f_flaw, fn_flaw, rect_mode=rect_mode)
+            assert h0_tmp == h0_flaw and w0_tmp == w0_flaw, f"Height or Width from template and flaw is not consistent: \nHeight: {h0_tmp} vs {h0_flaw}\n Width: {w0_tmp} vs {w0_flaw}"
+            assert im_tmp_shape == im_flaw_shape, f"Shape not consistent from template and flaw:\n {im_tmp_shape} vs {im_flaw_shape}"
+            # Add to buffer if training with augmentations
+            if self.augment:
+                self.ims[i], self.im_hw0[i], self.im_hw[i] = [im_tmp, im_flaw], (h0_tmp, w0_tmp), im_tmp_shape  # im, hw_original, hw_resized
+                self.buffer.append(i)
+                if len(self.buffer) >= self.max_buffer_length:
+                    j = self.buffer.pop(0)
+                    self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
+                return self.ims[i], self.im_hw0[i], self.im_hw[i]
+        else:    # already cached in RAM
+            return self.ims[i], self.im_hw0[i], self.im_hw[i]
+        # else:
+        #     raise Exception(f"Template img is not consistent with flaw img: \n Template: {f_tmp}; Flaw: {f_flaw}")
+
+    def get_labels(self):
+        """Returns dictionary of labels for YOLO training."""
+        # 1. 找label，通过im_files去在label文件夹里面找图片
+        self.label_files = [os.path.join(self.img_path, "labels", img_file_A.split(os.path.sep)[-1]) for img_file_A, img_file_B in self.im_files]
+        # /root/flaw_data/label/232323232.jpg
+        # /root/flaw_data/.cache
+        cache_path = Path(self.label_files[0]).parent.with_suffix('.cache')
+        try:
+            cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
+            assert cache['version'] == DATASET_CACHE_VERSION  # matches current version
+            assert cache['hash'] == get_hash(self.label_files + [f[0] for f in self.im_files])  # identical hash
+        except (FileNotFoundError, AssertionError, AttributeError):
+            cache, exists = self.cache_labels(cache_path), False  # run cache ops
+
+        # Display cache
+        nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupt, total
+        if exists and LOCAL_RANK in (-1, 0):
+            d = f'Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt'
+            TQDM(None, desc=self.prefix + d, total=n, initial=n)  # display results
+            if cache['msgs']:
+                LOGGER.info('\n'.join(cache['msgs']))  # display warnings
+
+        # Read cache
+        [cache.pop(k) for k in ('hash', 'version', 'msgs')]  # remove items
+        labels = cache['labels']
+        if not labels:
+            LOGGER.warning(f'WARNING ⚠️ No images found in {cache_path}, training may not work correctly. {HELP_URL}')
+        self.im_files = [lb['im_file'] for lb in labels]  # update im_files
+
+        # Check if the dataset is all boxes or all segments
+        # lengths = ((len(lb['cls']), len(lb['bboxes']), len(lb['segments'])) for lb in labels)
+        # len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
+        # if len_segments and len_boxes != len_segments:
+        #     LOGGER.warning(
+        #         f'WARNING ⚠️ Box and segment counts should be equal, but got len(segments) = {len_segments}, '
+        #         f'len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. '
+        #         'To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset.')
+        #     for lb in labels:
+        #         lb['segments'] = []
+        # if len_cls == 0:
+        #     LOGGER.warning(f'WARNING ⚠️ No labels found in {cache_path}, training may not work correctly. {HELP_URL}')
+        return labels
+
+    # 暂时先不要transforms
+    # def __getitem__(self, index):
+    #     """Returns transformed label information for given index."""
+    #     return self.transforms(self.get_image_and_label(index))
+
+    @staticmethod
+    def collate_fn(batch):
+        # 作用主要是把多个列表的两张图片分别在第一个维度concat
+        new_batch = {}
+        keys = batch[0].keys()  # [{'img': [tensor1, tensor2], ...}, {...}, {...}]
+
+        # [list(b.values()) for b in batch] -> [[v1, v2, v3], [v1, v2, v3], ...]
+        # zip(*) -> (v1, v1, ...) (v2, v2, ...), ....
+        # list -> [(v1, v1, ...), (v2, v2, ...), ...]
+        values = list(zip(*[list(b.values()) for b in batch]))
+        for i, k in enumerate(keys):
+            value = values[i]
+            if k == 'img':
+                # value: ([t1, t2], [t1, t2], ....)
+                # origin: value = torch.stack(value, 0)
+                value = [torch.stack([t1 for t1, t2 in value], 0), torch.stack([t2 for t1, t2 in value], 0)]
+            elif k == 'masks':
+                value = torch.stack(value, 0)
+            new_batch[k] = value
+        # new_batch['batch_idx'] = list(new_batch['batch_idx'])
+        # for i in range(len(new_batch['batch_idx'])):
+        #     new_batch['batch_idx'][i] += i  # add target image index for build_targets()
+        # new_batch['batch_idx'] = torch.cat(new_batch['batch_idx'], 0)
+        return new_batch
+
+    def cache_labels(self, path=Path('./labels.cache')):
+        """
+        Cache dataset labels, check images and read shapes.
+
+        Args:
+            path (Path): path where to save the cache file (default: Path('./labels.cache')).
+        Returns:
+            (dict): labels.
+        """
+        x = {'labels': []}
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
+        desc = f'{self.prefix}Scanning {path.parent / path.stem}...'
+        total = len(self.im_files)
+        # 这个东西是用于pose检测的
+        # nkpt, ndim = self.data.get('kpt_shape', (0, 0))
+        # if self.use_keypoints and (nkpt <= 0 or ndim not in (2, 3)):
+        #     raise ValueError("'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
+        #                      "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'")
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(func=verify_image_label_siamese,
+                                iterable=zip(self.im_files, self.label_files, repeat(self.prefix),
+                                             repeat(self.use_keypoints), repeat(len(self.data['names']))))
+            pbar = TQDM(results, desc=desc, total=total)
+            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    x['labels'].append(
+                        dict(
+                            im_file=im_file,
+                            shape=shape,
+                            masks=lb))
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f'{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt'
+            pbar.close()
+
+        if msgs:
+            LOGGER.info('\n'.join(msgs))
+        if nf == 0:
+            LOGGER.warning(f'{self.prefix}WARNING ⚠️ No labels found in {path}. {HELP_URL}')
+        # self.im_files : [[1, 2], [1, 2], [1, 2]]
+        x['hash'] = get_hash(self.label_files + [im_file[0] for im_file in self.im_files])
+        x['results'] = nf, nm, ne, nc, len(self.im_files)
+        x['msgs'] = msgs  # warnings
+        save_dataset_cache_file(self.prefix, path, x)
+        return x
+
+    def update_labels_info(self, label):
+        """Custom your label format here."""
+        # NOTE: cls is not with bboxes now, classification and semantic segmentation need an independent cls label
+        # We can make it also support classification and semantic segmentation by add or remove some dict keys there.
+        return label
+
+    def build_transforms(self, hyp=None):
+        """Builds and appends transforms to the list."""
+        transforms = SiameseToTensor()
+        return transforms
+
+    def get_image_and_label(self, index, rect_mode=False):
+        """Get and return label information from the dataset."""
+        label = deepcopy(self.labels[index])  # requires deepcopy() https://github.com/ultralytics/ultralytics/pull/1948
+        # 里面的label尺寸可能不对，要修改
+        label["masks"] = self.resize(label["masks"], rect_mode=rect_mode)
+        label.pop('shape', None)  # shape is for rect, remove it
+        label['img'], label['ori_shape'], label['resized_shape'] = self.load_image(index, rect_mode=rect_mode)
+        label['ratio_pad'] = (label['resized_shape'][0] / label['ori_shape'][0],
+                              label['resized_shape'][1] / label['ori_shape'][1])  # for evaluation
+        if self.rect:
+            label['rect_shape'] = self.batch_shapes[self.batch[index]]
+        return self.update_labels_info(label)

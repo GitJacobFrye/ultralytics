@@ -526,3 +526,33 @@ class v8ClassificationLoss:
         loss = torch.nn.functional.cross_entropy(preds, batch['cls'], reduction='mean')
         loss_items = loss.detach()
         return loss, loss_items
+
+# SiameseSegmentationLoss
+class v8SiameseSegmentationLoss(v8DetectionLoss):
+    def __init__(self, model):
+        super().__init__(model)
+
+    def __call__(self, preds, batch):
+        # 仅保留分割损失
+        loss = torch.zeros(1, device=self.device)  # 只保留 loss[0] 用于分割
+
+        # 模型输出直接是语义分割的 logits [B, C, H, W]
+        pred_masks = preds  # 假设 preds已经是 (B, num_classes, H, W)
+
+        # 获取真实标签（语义分割的像素级类别标签）
+        true_masks = batch['masks'].to(self.device).long()  # [B, H, W]，值为类别索引
+
+        # 检查尺寸是否匹配，必要时下采样标签
+        if true_masks.shape[-2:] != pred_masks.shape[-2:]:
+            true_masks = F.interpolate(true_masks.unsqueeze(1).float(),
+                                       size=pred_masks.shape[-2:],
+                                       mode='nearest').squeeze(1).long()
+
+        # 计算交叉熵损失
+        loss[0] = F.cross_entropy(pred_masks, true_masks, ignore_index=-1)
+
+        # 损失加权（根据需求调整）
+        loss[0] *= self.hyp.seg_weight  # 可设置语义分割的权重
+
+        # detach()的作用是什么？能不能不要detach()
+        return loss.sum(), loss.detach()

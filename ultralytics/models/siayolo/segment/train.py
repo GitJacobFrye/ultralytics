@@ -63,8 +63,8 @@ class SiameseSegmentationTrainer(SegmentationTrainer):
     def build_dataset(self, img_path, mode='train', batch=None):
         gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
         # no need for self.data
-        data = {
-            'nc': 2,
-            'names': ['flaw', 'background']
-        }
-        return build_siamese_dataset(self.args, img_path, batch, data, mode=mode, rect=mode == 'val', stride=gs)
+        # data = {
+        #     'nc': 2,
+        #     'names': ['', 'background']
+        # }
+        return build_siamese_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == 'val', stride=gs)

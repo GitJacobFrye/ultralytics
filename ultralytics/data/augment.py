@@ -1105,3 +1105,19 @@ class ToTensor:
         im = im.half() if self.half else im.float()  # uint8 to fp16/32
         im /= 255.0  # 0-255 to 0.0-1.0
         return im
+
+class SiameseToTensor:
+    """用来把label字典里面的两张图片和一个label全部从numpy.array转化为tensor结构"""
+
+    def __call__(self, label, half=False):
+        """label: {
+        img: List[np.array(400, 400, 3), np.array(400, 400, 3)],
+        masks: np.array(400, 400, 2)
+        }"""
+        label['img'] = [ToTensor(half=half)(label['img'][0]), ToTensor(half=half)(label['img'][1])]
+        msk = label['masks']
+        msk = np.ascontiguousarray(msk.transpose((2, 0, 1))[::-1])
+        msk = torch.from_numpy(msk)
+        msk = msk.half() if half else msk.float()
+        label['masks'] = msk
+        return label

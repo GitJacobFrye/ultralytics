@@ -2,7 +2,7 @@
 """Convolution modules."""
 
 import math
-
+from typing import List
 import numpy as np
 import torch
 import torch.nn as nn
@@ -65,6 +65,22 @@ class Conv2(Conv):
         self.__delattr__('cv2')
         self.forward = self.forward_fuse
 
+# Dual inputs with base Conv module
+class DualConv(Conv):
+    """ Dual input and dual output with same Conv module"""
+
+    def forward(self, x: List[torch.Tensor]):
+        x1, x2 = x
+        y1 = super(DualConv, self).forward(x1)
+        y2 = super(DualConv, self).forward(x2)
+        return [y1, y2]
+
+    def forward_fuse(self, x):
+        """Perform transposed convolution of 2D data."""
+        x1, x2 = x
+        y1 = super(DualConv, self).forward_fuse(x1)
+        y2 = super(DualConv, self).forward_fuse(x2)
+        return [y1, y2]
 
 class LightConv(nn.Module):
     """

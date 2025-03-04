@@ -34,14 +34,12 @@ def img2label_paths(img_paths):
     sa, sb = f'{os.sep}images{os.sep}', f'{os.sep}labels{os.sep}'  # /images/, /labels/ substrings
     return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.txt' for x in img_paths]
 
-
 def get_hash(paths):
     """Returns a single hash value of a list of paths (files or dirs)."""
     size = sum(os.path.getsize(p) for p in paths if os.path.exists(p))  # sizes
     h = hashlib.sha256(str(size).encode())  # hash sizes
     h.update(''.join(paths).encode())  # hash paths
     return h.hexdigest()  # return hash
-
 
 def exif_size(img: Image.Image):
     """Returns exif-corrected PIL size."""
@@ -54,7 +52,6 @@ def exif_size(img: Image.Image):
                 if rotation in [6, 8]:  # rotation 270 or 90
                     s = s[1], s[0]
     return s
-
 
 def verify_image(args):
     """Verify one image."""
@@ -79,7 +76,6 @@ def verify_image(args):
         nc = 1
         msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
     return (im_file, cls), nf, nc, msg
-
 
 def verify_image_label(args):
     """Verify one image-label pair."""
@@ -151,6 +147,71 @@ def verify_image_label(args):
         msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
         return [None, None, None, None, None, nm, nf, ne, nc, msg]
 
+def verify_image_siamese(im_file, prefix):
+    # Verify images
+    im = Image.open(im_file)
+    im.verify()  # PIL verify
+    shape = exif_size(im)  # image size
+    shape = (shape[1], shape[0])  # hw
+    assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+    assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
+    if im.format.lower() in ('jpg', 'jpeg'):
+        with open(im_file, 'rb') as f:
+            f.seek(-2, 2)
+            if f.read() != b'\xff\xd9':  # corrupt JPEG
+                ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                msg = f'{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved'
+            else:
+                msg = ''
+    else:
+        msg = 'Incorrect image file format.'
+    return shape, msg
+
+def verify_image_label_siamese(args):
+    """Verify one image-label pair."""
+    # im_file : (im1, im2)
+    im_file, lb_file, prefix, keypoint, num_cls = args
+    # Number (missing, found, empty, corrupt), message, segments, keypoints
+    nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, '', [], None
+    try:
+        # Verify images
+        im_file_tmp, im_file_flaw = im_file
+        shape_tmp, msg = verify_image_siamese(im_file_tmp, prefix)
+        shape_flaw, msg = verify_image_siamese(im_file_flaw, prefix)
+
+        # Verify labels
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            # lb_file是一张0-1图片
+            # 1. 需要检验label的通道数和num_cls一致
+            # 2. abel的shape和训练图片的shape是一致的
+            assert num_cls == 2, "Siamese dataset only supports 2 classes."
+            img = Image.open(lb_file)
+            # Three formats are accepted: [400, 400] with bit-depth as 8, [400, 400, 3] with bit-depth as 24, [400, 400, 4] with bit-depth as 32
+            img = np.array(img)
+            _shape = img.shape
+            if len(_shape) == 3:
+                # jpg or png format
+                lb = img[:, :, 0]   # [400, 400]
+            elif len(_shape) == 2:
+                lb = img
+            else:
+                raise ValueError("Input label should be png, jpg or jpeg.")
+            # 防止label和flaw不一致的情况
+            assert lb.shape == shape_flaw, f"Label shape is not consistent with input shape: label shape: {lb.shape}, input flaw shape: {shape_flaw}"
+            # 出现了flaw和template大小不一致的情况
+            assert shape_tmp == shape_flaw, f"Template & Flaw are not consistent: tmp_shape: {shape_tmp}, flaw_shape: {shape_flaw}."
+            lb = np.stack([1 - lb, lb], axis=-1)  # [400, 400, 2]: background, flaw
+        else:
+            nm = 1  # label missing
+            # lb = np.zeros((0, 5), dtype=np.float32)
+            lb = None
+        # lb = lb[:, :5]
+        return im_file, lb, shape_flaw, segments, keypoints, nm, nf, ne, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
+        return [None, None, None, None, None, nm, nf, ne, nc, msg]
 
 def polygon2mask(imgsz, polygons, color=1, downsample_ratio=1):
     """

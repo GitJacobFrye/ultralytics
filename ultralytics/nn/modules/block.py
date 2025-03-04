@@ -7,10 +7,10 @@ import torch.nn.functional as F
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
 from .transformer import TransformerBlock
+from typing import List
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ResNetLayer')
-
 
 class DFL(nn.Module):
     """
@@ -148,6 +148,13 @@ class SPPF(nn.Module):
         y2 = self.m(y1)
         return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
 
+# DualInput
+class DualSPPF(SPPF):
+    def forward(self, x: List[torch.Tensor]):
+        x1, x2 = x
+        y1 = super(DualSPPF, self).forward(x1)
+        y2 = super(DualSPPF, self).forward(x2)
+        return [y1, y2]
 
 class C1(nn.Module):
     """CSP Bottleneck with 1 convolution."""
@@ -209,6 +216,21 @@ class C2f(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
+# Dual inputs
+class DualC2f(C2f):
+    """Dual CSP Bottleneck with 2 convolutions."""
+
+    def forward(self, x: List[torch.Tensor]):
+        x1, x2 = x
+        y1 = super(DualC2f, self).forward(x1)
+        y2 = super(DualC2f, self).forward(x2)
+        return [y1, y2]
+
+    def forward_split(self, x: List[torch.Tensor]):
+        x1, x2 = x
+        y1 = super(DualC2f, self).forward(x1)
+        y2 = super(DualC2f, self).forward(x2)
+        return [y1, y2]
 
 class C3(nn.Module):
     """CSP Bottleneck with 3 convolutions."""
@@ -369,3 +391,12 @@ class ResNetLayer(nn.Module):
     def forward(self, x):
         """Forward pass through the ResNet layer."""
         return self.layer(x)
+
+# Diff
+class Diff(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x:List[torch.Tensor]) -> torch.Tensor:
+        x1, x2 = x
+        return x1 - x2

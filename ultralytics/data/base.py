@@ -60,7 +60,8 @@ class BaseDataset(Dataset):
                  pad=0.5,
                  single_cls=False,
                  classes=None,
-                 fraction=1.0):
+                 fraction=1.0,
+                 siamese=False):
         """Initialize BaseDataset with given configuration and options."""
         super().__init__()
         self.img_path = img_path
@@ -89,7 +90,10 @@ class BaseDataset(Dataset):
         if cache == 'ram' and not self.check_cache_ram():
             cache = False
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
-        self.npy_files = [Path(f).with_suffix('.npy') for f in self.im_files]
+        if siamese:
+            self.npy_files = [[Path(f[0]).with_suffix('.npy'), Path(f[1]).with_suffix('.npy')] for f in self.im_files]
+        else:
+            self.npy_files = [Path(f).with_suffix('.npy') for f in self.im_files]
         if cache:
             self.cache_images(cache)
 

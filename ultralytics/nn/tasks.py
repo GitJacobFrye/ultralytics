@@ -7,13 +7,14 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x,
-                                    Classify, Concat, Conv, Conv2, ConvTranspose, Detect, DWConv, DWConvTranspose2d,
+from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, DualSPPF, Bottleneck, BottleneckCSP, C2f, DualC2f, Diff, C3Ghost, C3x,
+                                    Classify, Concat, Conv, DualConv, Conv2, ConvTranspose, Detect, DWConv, DWConvTranspose2d,
                                     Focus, GhostBottleneck, GhostConv, HGBlock, HGStem, Pose, RepC3, RepConv,
                                     ResNetLayer, RTDETRDecoder, Segment)
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
-from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8PoseLoss, v8SegmentationLoss
+from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8PoseLoss, v8SegmentationLoss, \
+    v8SiameseSegmentationLoss
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (fuse_conv_and_bn, fuse_deconv_and_bn, initialize_weights, intersect_dicts,
                                            make_divisible, model_info, scale_img, time_sync)
@@ -239,7 +240,11 @@ class DetectionModel(BaseModel):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, Pose)) else self.forward(x)
-            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
+            # 这里由于双输入缘故需要修改一下
+            if self.yaml.get("input", "Single") == "Dual":
+                m.stride = torch.tensor([s / x.shape[-2] for x in forward([torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s)])])  # forward
+            else:
+                m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
             m.bias_init()  # only run once
         else:
@@ -303,6 +308,41 @@ class SegmentationModel(DetectionModel):
         """Initialize the loss criterion for the SegmentationModel."""
         return v8SegmentationLoss(self)
 
+# 用于双孪生瑕疵目标检测的网络
+class SiameseSegModel(SegmentationModel):
+    """YOLOv8 siamese segmentation model."""
+
+    def __init__(self, cfg='yolov8-siamese.yaml', ch=3, nc=None, verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    # 输入需要修改x = [real, template]
+    def _predict_once(self, x, profile=False, visualize=False):
+        """
+        Perform a forward pass through the network.
+
+        Args:
+            x (torch.Tensor): The input tensor to the model.
+            profile (bool):  Print the computation time of each layer if True, defaults to False.
+            visualize (bool): Save the feature maps of the model if True, defaults to False.
+
+        Returns:
+            (torch.Tensor): The last output of the model.
+        """
+        y, dt = [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+        return x
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the SiameseModel."""
+        return v8SiameseSegmentationLoss(self)
 
 class PoseModel(DetectionModel):
     """YOLOv8 pose model."""
@@ -683,7 +723,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in (Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
-                 BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3):
+                 BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3,
+                 DualC2f, DualConv, DualSPPF):
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -715,6 +756,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
+        # 堆叠
         m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         m.np = sum(x.numel() for x in m_.parameters())  # number params
@@ -727,7 +769,6 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             ch = []
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
-
 
 def yaml_model_load(path):
     """Load a YOLOv8 model from a YAML file."""
